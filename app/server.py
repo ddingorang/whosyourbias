@@ -39,8 +39,8 @@ predictor = None
 device_str = "cuda" if torch.cuda.is_available() else "cpu"
 inference_lock = threading.Lock()
 
-MODEL_PATH = ROOT / "sam2" / "checkpoints" / "sam2.1_hiera_base_plus.pt"
-MODEL_CFG  = "configs/samurai/sam2.1_hiera_b+.yaml"
+MODEL_PATH = ROOT / "sam2" / "checkpoints" / "sam2.1_hiera_small.pt"
+MODEL_CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 
 # 객체별 색상 (BGR) — 최대 8개 객체
 COLORS_BGR = [
@@ -139,6 +139,7 @@ def _assemble_videos(
     crop_log: list,   # crop_log[f][oid] = (cx, cy)                — inference-space coords
     fps: float, job_id: str, n_objs: int,
     scale: float, src_w: int, src_h: int,
+    start_frame: int = 0,
 ) -> tuple[str, list[str]]:
     """추론 완료 후 원본 영상을 1회 재독해 메인·크롭 영상을 원본 해상도로 생성한다."""
     import imageio
@@ -164,6 +165,7 @@ def _assemble_videos(
     ]
 
     cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     for bboxes, centers in zip(bbox_log, crop_log):
         ret, frame = cap.read()
         if not ret:
@@ -198,7 +200,7 @@ def _assemble_videos(
 
 
 # ── Inference worker ───────────────────────────────────────────────────────────
-def run_inference(job_id: str, video_path: str, bboxes: list[list[int]]):
+def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_frame: int = 0):
     """청크 분할 방식으로 다중 객체를 추적."""
     chunk_dir = None
     try:
@@ -215,9 +217,7 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]]):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
-        # 앞 1분만 처리
-        max_frames = int(fps * 60)
-        total_frames = min(total_frames, max_frames)
+        total_frames = total_frames - start_frame
 
         scale, out_w, out_h = _scale_params(src_w, src_h)
         n_chunks = math.ceil(total_frames / CHUNK_FRAMES)
@@ -243,8 +243,8 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]]):
         )
 
         for chunk_idx in range(n_chunks):
-            chunk_start = chunk_idx * CHUNK_FRAMES
-            chunk_end   = min(chunk_start + CHUNK_FRAMES, total_frames)
+            chunk_start = start_frame + chunk_idx * CHUNK_FRAMES
+            chunk_end   = min(chunk_start + CHUNK_FRAMES, start_frame + total_frames)
             n_frames    = chunk_end - chunk_start
 
             jobs[job_id]["chunk"] = f"{chunk_idx + 1}/{n_chunks}"
@@ -299,7 +299,7 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]]):
                         # 좌표만 기록 (인코딩은 추론 완료 후 원본 해상도로 수행)
                         bbox_log.append(frame_bboxes)
                         crop_log.append([(ema_cx[oid], ema_cy[oid]) for oid in range(n_objs)])
-                        jobs[job_id]["progress"] = int((chunk_start + fid + 1) / total_frames * 100)
+                        jobs[job_id]["progress"] = int((chunk_idx * CHUNK_FRAMES + fid + 1) / total_frames * 100)
 
             # ─ 다음 청크 초기 bbox = 이전 청크 마지막 마스크 ────────────────
             new_bboxes = []
@@ -321,6 +321,7 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]]):
         main_filename, crop_filenames = _assemble_videos(
             video_path, bbox_log, crop_log,
             fps, job_id, n_objs, scale, src_w, src_h,
+            start_frame,
         )
 
         jobs[job_id].update({
@@ -387,9 +388,22 @@ async def upload_video(file: UploadFile = File(...)):
     }
 
 
+@app.get("/api/frame")
+async def get_frame(video_path: str, frame_idx: int = 0):
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise HTTPException(400, "해당 프레임을 읽을 수 없습니다.")
+    _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return {"frame": f"data:image/jpeg;base64,{base64.b64encode(jpg.tobytes()).decode()}"}
+
+
 class TrackRequest(BaseModel):
     video_path: str
     bboxes: list[list[int]]   # [[x1,y1,x2,y2], ...] — 원본 해상도 기준
+    start_frame: int = 0      # bbox를 그린 프레임 인덱스
 
 
 @app.post("/api/track")
@@ -408,7 +422,7 @@ async def start_tracking(req: TrackRequest):
 
     threading.Thread(
         target=run_inference,
-        args=(job_id, req.video_path, req.bboxes),
+        args=(job_id, req.video_path, req.bboxes, req.start_frame),
         daemon=True,
     ).start()
 

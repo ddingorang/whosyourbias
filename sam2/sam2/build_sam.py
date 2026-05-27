@@ -157,11 +157,22 @@ def build_sam2_video_predictor_hf(model_id, **kwargs):
 def _load_checkpoint(model, ckpt_path):
     if ckpt_path is not None:
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
-        missing_keys, unexpected_keys = model.load_state_dict(sd)
+
+        # num_maskmem이 체크포인트와 다를 때 maskmem_tpos_enc 앞쪽만 잘라 사용
+        if "maskmem_tpos_enc" in sd and hasattr(model, "maskmem_tpos_enc"):
+            ckpt_n  = sd["maskmem_tpos_enc"].shape[0]
+            model_n = model.maskmem_tpos_enc.shape[0]
+            if ckpt_n != model_n:
+                sd["maskmem_tpos_enc"] = sd["maskmem_tpos_enc"][:model_n]
+                logging.warning(
+                    f"maskmem_tpos_enc truncated: {ckpt_n} → {model_n} "
+                    f"(num_maskmem 설정값에 맞게 조정)"
+                )
+
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
         if missing_keys:
             logging.error(missing_keys)
             raise RuntimeError()
         if unexpected_keys:
-            logging.error(unexpected_keys)
-            raise RuntimeError()
-        logging.info("Loaded checkpoint sucessfully")
+            logging.warning(f"Checkpoint에만 존재하는 키 (무시됨): {unexpected_keys}")
+        logging.info("Loaded checkpoint successfully")

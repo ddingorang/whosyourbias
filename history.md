@@ -2,6 +2,52 @@
 
 ---
 
+## 2026-05-19
+
+### 1. 모델 교체 및 추론 속도 최적화
+
+**파일:** `sam2/sam2/configs/samurai/sam2.1_hiera_s.yaml`
+**체크포인트:** `sam2/checkpoints/`
+
+**배경:** 정밀한 세그멘테이션 마스크가 불필요하고(bbox 추출만 사용), 추론 속도 단축이 목표.
+
+**모델 교체:**
+
+| 항목 | 변경 전 | 변경 후 |
+|---|---|---|
+| 체크포인트 | `sam2.1_hiera_base_plus.pt` (309MB) | `sam2.1_hiera_small.pt` (176MB) |
+| config | `sam2.1_hiera_b+.yaml` | `sam2.1_hiera_s.yaml` |
+
+**하이퍼파라미터 변경 (`sam2.1_hiera_s.yaml`):**
+
+| 파라미터 | 변경 전 | 변경 후 | 이유 |
+|---|---|---|---|
+| `image_size` | 1024 | 512 | bbox 추출에 고해상도 불필요, 메모리 어텐션 연산 4배 감소 |
+| `use_high_res_features_in_sam` | true | false | 마스크 경계 정밀도 전용, bbox 추출에 불필요 (FPN 피처 레벨 3→1) |
+| `multimask_output_in_sam` | true | false | 3개 마스크 후보 생성 불필요 |
+| `multimask_output_for_tracking` | true | false | 동일 |
+| `use_multimask_token_for_obj_ptr` | true | false | multimask 비활성화에 따른 연동 설정 |
+| `num_maskmem` | 7 | 4 | 메모리 뱅크 크기 축소, 메모리 어텐션 연산 감소 |
+| `max_obj_ptrs_in_encoder` | 16 (기본값) | 8 | object pointer 어텐션 토큰 수 감소 |
+| `compile_image_encoder` | False | True | torch.compile으로 이미지 인코더 20~40% 속도 향상 |
+
+**유지한 설정 (추적 잠금 핵심):**
+- `kf_score_weight: 0.25` — 칼만 필터 기반 모션 예측
+- `stable_frames_threshold: 15` — KF 안정화 임계값
+- `memory_bank_iou_threshold: 0.5` — 메모리 뱅크 품질 필터
+- `pred_obj_scores: true` — 객체 소실 감지
+
+**실행 명령:**
+```bash
+python scripts/demo.py \
+  --video_path <video.mp4> \
+  --txt_path <bbox.txt> \
+  --model_path sam2/checkpoints/sam2.1_hiera_small.pt \
+  --video_output_path demo.mp4
+```
+
+---
+
 ## 2026-05-12
 
 ### 1. 입력 영상 처리 범위 제한 — 앞 1분만 처리

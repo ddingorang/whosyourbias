@@ -438,6 +438,27 @@
       flex-shrink: 0;
     }
 
+    /* frame scrubber */
+    .frame-scrubber {
+      display: flex; flex-direction: column; gap: 6px;
+      margin-bottom: 12px;
+    }
+    .frame-scrubber-row {
+      display: flex; align-items: center; gap: 10px;
+    }
+    .btn-frame-nav {
+      width: 28px; height: 28px; flex-shrink: 0;
+      background: var(--canvas); border: 1px solid var(--hairline-strong);
+      border-radius: var(--r-md); cursor: pointer;
+      font-size: 16px; color: var(--charcoal); font-family: inherit;
+      display: flex; align-items: center; justify-content: center;
+      transition: background .15s;
+    }
+    .btn-frame-nav:hover:not(:disabled) { background: var(--surface); }
+    .btn-frame-nav:disabled { opacity: .35; cursor: not-allowed; }
+    #frame-counter { font-size: 13px; color: var(--slate); white-space: nowrap; }
+    #frame-slider { flex: 1; accent-color: var(--primary); cursor: pointer; }
+
     .hidden { display: none !important; }
 
     /* ══════════════════════════════════════════════
@@ -563,18 +584,27 @@
   <!-- Left: canvas area -->
   <div class="p2-canvas">
     <div class="p2-canvas-top">
-      <span class="p2-label">첫 번째 프레임</span>
+      <span class="p2-label">프레임 선택</span>
       <div class="video-tags" id="video-tags"></div>
     </div>
 
     <div class="hint-bar">
       <span>✏️</span>
-      <span>드래그하여 추적할 객체에 박스를 그리세요.
+      <span>슬라이더로 원하는 장면을 선택한 뒤, 드래그하여 추적할 객체에 박스를 그리세요.
         여러 박스를 추가할 수 있습니다 <strong>(최대 8개)</strong>.</span>
     </div>
 
+    <div class="frame-scrubber" id="frame-scrubber">
+      <div class="frame-scrubber-row">
+        <button class="btn-frame-nav" id="btn-prev-frame" onclick="seekFrame(frameIdx - 1)" disabled>‹</button>
+        <span id="frame-counter">프레임 1 / 1</span>
+        <button class="btn-frame-nav" id="btn-next-frame" onclick="seekFrame(frameIdx + 1)" disabled>›</button>
+        <input type="range" id="frame-slider" min="0" max="0" value="0" style="flex:1">
+      </div>
+    </div>
+
     <div class="frame-wrapper" id="frame-wrapper">
-      <img id="first-frame" alt="첫 번째 프레임">
+      <img id="first-frame" alt="프레임">
       <canvas id="bbox-canvas"></canvas>
     </div>
   </div>
@@ -675,11 +705,23 @@ let bboxList  = [];
 let drawing   = false;
 let startX = 0, startY = 0;
 let pollTimer = null;
+let frameIdx   = 0;
+let totalFrames = 0;
+let fetchTimer  = null;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 checkHealth();
 initDrop();
 initCanvas();
+
+document.getElementById('frame-slider').addEventListener('input', e => {
+  const idx = parseInt(e.target.value);
+  frameIdx = idx;
+  updateFrameCounter();
+  resetBbox();
+  clearTimeout(fetchTimer);
+  fetchTimer = setTimeout(() => fetchFrame(idx), 250);
+});
 
 document.getElementById('btn-pick').addEventListener('click', () =>
   document.getElementById('file-input').click()
@@ -768,6 +810,13 @@ async function handleFile(file) {
       warnEl.classList.add('hidden');
     }
 
+    totalFrames = d.total_frames;
+    frameIdx    = 0;
+    const slider = document.getElementById('frame-slider');
+    slider.max   = totalFrames - 1;
+    slider.value = 0;
+    updateFrameCounter();
+
     document.getElementById('first-frame').src = d.first_frame;
     goStep(2);
 
@@ -783,6 +832,33 @@ async function handleFile(file) {
       document.getElementById('file-input').click()
     );
   }
+}
+
+// ── Frame navigation ──────────────────────────────────────────────────────────
+function updateFrameCounter() {
+  document.getElementById('frame-counter').textContent =
+    `프레임 ${frameIdx + 1} / ${totalFrames}`;
+  document.getElementById('btn-prev-frame').disabled = frameIdx <= 0;
+  document.getElementById('btn-next-frame').disabled = frameIdx >= totalFrames - 1;
+}
+
+async function seekFrame(idx) {
+  idx = Math.max(0, Math.min(idx, totalFrames - 1));
+  if (idx === frameIdx && document.getElementById('first-frame').src) return;
+  frameIdx = idx;
+  document.getElementById('frame-slider').value = idx;
+  updateFrameCounter();
+  resetBbox();
+  await fetchFrame(idx);
+}
+
+async function fetchFrame(idx) {
+  if (!videoPath) return;
+  try {
+    const res = await fetch(`/api/frame?video_path=${encodeURIComponent(videoPath)}&frame_idx=${idx}`);
+    const d   = await res.json();
+    if (d.frame) document.getElementById('first-frame').src = d.frame;
+  } catch { /* 무시 */ }
 }
 
 // ── Canvas drawing ────────────────────────────────────────────────────────────
@@ -938,7 +1014,7 @@ async function startTracking() {
     const res = await fetch('/api/track', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ video_path: videoPath, bboxes: videoBboxes }),
+      body: JSON.stringify({ video_path: videoPath, bboxes: videoBboxes, start_frame: frameIdx }),
     });
     const d = await res.json();
     if (!res.ok) throw new Error(d.detail || '추적 요청 실패');
@@ -1027,8 +1103,13 @@ function goStep(n) {
 
 function goBack() {
   if (pollTimer) clearInterval(pollTimer);
-  bboxList = [];
+  bboxList = []; frameIdx = 0; totalFrames = 0;
   redrawCanvas(); renderObjList();
+  const slider = document.getElementById('frame-slider');
+  slider.max = 0; slider.value = 0;
+  document.getElementById('frame-counter').textContent = '프레임 1 / 1';
+  document.getElementById('btn-prev-frame').disabled = true;
+  document.getElementById('btn-next-frame').disabled = true;
   document.getElementById('file-input').value = '';
   const zone = document.getElementById('dropzone');
   zone.innerHTML = `<span class="upload-icon">🎬</span>
