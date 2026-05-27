@@ -596,9 +596,9 @@
 
     <div class="frame-scrubber" id="frame-scrubber">
       <div class="frame-scrubber-row">
-        <button class="btn-frame-nav" id="btn-prev-frame" onclick="seekFrame(frameIdx - 1)" disabled>‹</button>
-        <span id="frame-counter">프레임 1 / 1</span>
-        <button class="btn-frame-nav" id="btn-next-frame" onclick="seekFrame(frameIdx + 1)" disabled>›</button>
+        <button class="btn-frame-nav" id="btn-prev-frame" onclick="seekSec(-1)" disabled>‹</button>
+        <span id="frame-counter">0:00 / 0:00</span>
+        <button class="btn-frame-nav" id="btn-next-frame" onclick="seekSec(+1)" disabled>›</button>
         <input type="range" id="frame-slider" min="0" max="0" value="0" style="flex:1">
       </div>
     </div>
@@ -707,7 +707,9 @@ let startX = 0, startY = 0;
 let pollTimer = null;
 let frameIdx   = 0;
 let totalFrames = 0;
+let videoFps    = 30;
 let fetchTimer  = null;
+let fetchAbort  = null;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 checkHealth();
@@ -715,12 +717,12 @@ initDrop();
 initCanvas();
 
 document.getElementById('frame-slider').addEventListener('input', e => {
-  const idx = parseInt(e.target.value);
-  frameIdx = idx;
+  const sec = parseInt(e.target.value);
+  frameIdx = Math.min(Math.round(sec * videoFps), totalFrames - 1);
   updateFrameCounter();
   resetBbox();
   clearTimeout(fetchTimer);
-  fetchTimer = setTimeout(() => fetchFrame(idx), 250);
+  fetchTimer = setTimeout(() => fetchFrame(frameIdx), 250);
 });
 
 document.getElementById('btn-pick').addEventListener('click', () =>
@@ -810,10 +812,11 @@ async function handleFile(file) {
       warnEl.classList.add('hidden');
     }
 
+    videoFps    = d.fps || 30;
     totalFrames = d.total_frames;
     frameIdx    = 0;
     const slider = document.getElementById('frame-slider');
-    slider.max   = totalFrames - 1;
+    slider.max   = Math.floor((totalFrames - 1) / videoFps);
     slider.value = 0;
     updateFrameCounter();
 
@@ -836,29 +839,43 @@ async function handleFile(file) {
 
 // ── Frame navigation ──────────────────────────────────────────────────────────
 function updateFrameCounter() {
-  document.getElementById('frame-counter').textContent =
-    `프레임 ${frameIdx + 1} / ${totalFrames}`;
-  document.getElementById('btn-prev-frame').disabled = frameIdx <= 0;
-  document.getElementById('btn-next-frame').disabled = frameIdx >= totalFrames - 1;
+  const fps      = videoFps || 30;
+  const curSec   = Math.floor(frameIdx / fps);
+  const totalSec = Math.floor((totalFrames - 1) / fps);
+  const fmt = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  document.getElementById('frame-counter').textContent = `${fmt(curSec)} / ${fmt(totalSec)}`;
+  document.getElementById('btn-prev-frame').disabled = curSec <= 0;
+  document.getElementById('btn-next-frame').disabled = curSec >= totalSec;
 }
 
-async function seekFrame(idx) {
-  idx = Math.max(0, Math.min(idx, totalFrames - 1));
-  if (idx === frameIdx && document.getElementById('first-frame').src) return;
-  frameIdx = idx;
-  document.getElementById('frame-slider').value = idx;
+async function seekSec(delta) {
+  const fps      = videoFps || 30;
+  const curSec   = Math.floor(frameIdx / fps);
+  const totalSec = Math.floor((totalFrames - 1) / fps);
+  const newSec   = Math.max(0, Math.min(curSec + delta, totalSec));
+  const newFrame = Math.min(Math.round(newSec * fps), totalFrames - 1);
+  if (newFrame === frameIdx) return;
+  frameIdx = newFrame;
+  document.getElementById('frame-slider').value = newSec;
   updateFrameCounter();
   resetBbox();
-  await fetchFrame(idx);
+  await fetchFrame(newFrame);
 }
 
 async function fetchFrame(idx) {
   if (!videoPath) return;
+  if (fetchAbort) fetchAbort.abort();
+  fetchAbort = new AbortController();
   try {
-    const res = await fetch(`/api/frame?video_path=${encodeURIComponent(videoPath)}&frame_idx=${idx}`);
-    const d   = await res.json();
+    const res = await fetch(
+      `/api/frame?video_path=${encodeURIComponent(videoPath)}&frame_idx=${idx}`,
+      { signal: fetchAbort.signal }
+    );
+    const d = await res.json();
     if (d.frame) document.getElementById('first-frame').src = d.frame;
-  } catch { /* 무시 */ }
+  } catch (e) {
+    if (e.name !== 'AbortError') { /* 무시 */ }
+  }
 }
 
 // ── Canvas drawing ────────────────────────────────────────────────────────────
@@ -1103,11 +1120,11 @@ function goStep(n) {
 
 function goBack() {
   if (pollTimer) clearInterval(pollTimer);
-  bboxList = []; frameIdx = 0; totalFrames = 0;
+  bboxList = []; frameIdx = 0; totalFrames = 0; videoFps = 30;
   redrawCanvas(); renderObjList();
   const slider = document.getElementById('frame-slider');
   slider.max = 0; slider.value = 0;
-  document.getElementById('frame-counter').textContent = '프레임 1 / 1';
+  document.getElementById('frame-counter').textContent = '0:00 / 0:00';
   document.getElementById('btn-prev-frame').disabled = true;
   document.getElementById('btn-next-frame').disabled = true;
   document.getElementById('file-input').value = '';

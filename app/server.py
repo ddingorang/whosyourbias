@@ -39,6 +39,10 @@ predictor = None
 device_str = "cuda" if torch.cuda.is_available() else "cpu"
 inference_lock = threading.Lock()
 
+# 미리보기용 VideoCapture 캐시 — 요청마다 파일을 다시 열지 않음
+_preview_caps: dict[str, cv2.VideoCapture] = {}
+_preview_lock = threading.Lock()
+
 MODEL_PATH = ROOT / "sam2" / "checkpoints" / "sam2.1_hiera_small.pt"
 MODEL_CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 
@@ -61,6 +65,7 @@ CHUNK_FRAMES = 300   # 청크당 최대 프레임 (~10초 @30fps)
                      # 300 × ~6MB ≈ 1.8GB → 모델·어텐션 버퍼 포함 16GB 내 안전
 
 CROP_EMA_ALPHA = 0.4  # 크롭 중심 EMA 평활 계수 (클수록 최신 bbox에 민감)
+FRAME_SKIP     = 2    # SAM2에 넘길 프레임 샘플링 간격 (1=전체, 2=절반, 3=1/3 …)
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
@@ -266,10 +271,12 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_f
                 break
 
             chunk_dir = UPLOADS_DIR / f"{job_id}_chunk{chunk_idx}"
-            _write_chunk_jpegs(frames, chunk_dir)
+            _write_chunk_jpegs(frames[::FRAME_SKIP], chunk_dir)
 
-            # ─ SAM2 다중 객체 추적 ──────────────────────────────────────────
+            # ─ SAM2 추적 (FRAME_SKIP 간격으로 샘플링된 프레임만 처리) ────────
             last_masks: dict[int, np.ndarray] = {}
+            sampled_bboxes: list = []  # sampled_bboxes[s][oid] = bbox or None
+
             with inference_lock:
                 with torch.inference_mode(), ctx:
                     state = predictor.init_state(
@@ -282,24 +289,42 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_f
 
                     for fid, obj_ids, masks in predictor.propagate_in_video(state):
                         frame_bboxes: list = [None] * n_objs
-
                         for obj_id, mask in zip(obj_ids, masks):
                             m = mask[0].cpu().numpy() > 0.0
                             last_masks[obj_id] = m
+                            frame_bboxes[obj_id] = _mask_to_bbox(m)
+                        sampled_bboxes.append(frame_bboxes)
+                        jobs[job_id]["progress"] = int(
+                            (chunk_idx * CHUNK_FRAMES + min(fid * FRAME_SKIP + 1, len(frames))) / total_frames * 100
+                        )
 
-                            bb = _mask_to_bbox(m)
-                            frame_bboxes[obj_id] = bb
-                            if bb:
-                                xmin, ymin, xmax, ymax = bb
-                                raw_cx = (xmin + xmax) / 2.0
-                                raw_cy = (ymin + ymax) / 2.0
-                                ema_cx[obj_id] = CROP_EMA_ALPHA * raw_cx + (1 - CROP_EMA_ALPHA) * ema_cx[obj_id]
-                                ema_cy[obj_id] = CROP_EMA_ALPHA * raw_cy + (1 - CROP_EMA_ALPHA) * ema_cy[obj_id]
+            # ─ 보간: 샘플 bbox → 전체 프레임 bbox + EMA ──────────────────────
+            n_sampled = len(sampled_bboxes)
+            for f in range(len(frames)):
+                s_lo = min(f // FRAME_SKIP, n_sampled - 1)
+                s_hi = min(s_lo + 1, n_sampled - 1)
+                alpha = (f % FRAME_SKIP) / FRAME_SKIP if s_lo < s_hi else 0.0
 
-                        # 좌표만 기록 (인코딩은 추론 완료 후 원본 해상도로 수행)
-                        bbox_log.append(frame_bboxes)
-                        crop_log.append([(ema_cx[oid], ema_cy[oid]) for oid in range(n_objs)])
-                        jobs[job_id]["progress"] = int((chunk_idx * CHUNK_FRAMES + fid + 1) / total_frames * 100)
+                frame_bboxes = [None] * n_objs
+                for oid in range(n_objs):
+                    bb_lo = sampled_bboxes[s_lo][oid]
+                    bb_hi = sampled_bboxes[s_hi][oid]
+                    if bb_lo is None:
+                        bb = bb_hi
+                    elif bb_hi is None or alpha == 0.0:
+                        bb = bb_lo
+                    else:
+                        bb = tuple(int(bb_lo[i] * (1 - alpha) + bb_hi[i] * alpha) for i in range(4))
+                    frame_bboxes[oid] = bb
+
+                    if bb:
+                        cx = (bb[0] + bb[2]) / 2.0
+                        cy = (bb[1] + bb[3]) / 2.0
+                        ema_cx[oid] = CROP_EMA_ALPHA * cx + (1 - CROP_EMA_ALPHA) * ema_cx[oid]
+                        ema_cy[oid] = CROP_EMA_ALPHA * cy + (1 - CROP_EMA_ALPHA) * ema_cy[oid]
+
+                bbox_log.append(frame_bboxes)
+                crop_log.append([(ema_cx[oid], ema_cy[oid]) for oid in range(n_objs)])
 
             # ─ 다음 청크 초기 bbox = 이전 청크 마지막 마스크 ────────────────
             new_bboxes = []
@@ -390,13 +415,24 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.get("/api/frame")
 async def get_frame(video_path: str, frame_idx: int = 0):
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ret, frame = cap.read()
-    cap.release()
+    with _preview_lock:
+        if video_path not in _preview_caps or not _preview_caps[video_path].isOpened():
+            _preview_caps.get(video_path, None) and _preview_caps[video_path].release()
+            _preview_caps[video_path] = cv2.VideoCapture(video_path)
+        cap = _preview_caps[video_path]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+
     if not ret:
         raise HTTPException(400, "해당 프레임을 읽을 수 없습니다.")
-    _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    # 미리보기용 해상도 축소 (전송량 감소)
+    h, w = frame.shape[:2]
+    if w > 1280:
+        scale = 1280 / w
+        frame = cv2.resize(frame, (int(w * scale) & ~1, int(h * scale) & ~1), interpolation=cv2.INTER_AREA)
+
+    _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
     return {"frame": f"data:image/jpeg;base64,{base64.b64encode(jpg.tobytes()).decode()}"}
 
 
