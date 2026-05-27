@@ -206,7 +206,7 @@ def _assemble_videos(
 
 # ── Inference worker ───────────────────────────────────────────────────────────
 def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_frame: int = 0):
-    """청크 분할 방식으로 다중 객체를 추적."""
+    """양방향 청크 추적: start_frame 이전은 역방향, 이후는 순방향으로 처리 후 시간순 결합."""
     chunk_dir = None
     try:
         jobs[job_id]["status"] = "running"
@@ -214,7 +214,7 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_f
         if predictor is None:
             raise RuntimeError("모델이 로드되지 않았습니다. 체크포인트를 다운로드하세요.")
 
-        # 영상 정보
+        # ── 영상 메타 ──────────────────────────────────────────────────────────
         cap = cv2.VideoCapture(video_path)
         fps          = cap.get(cv2.CAP_PROP_FPS) or 30
         src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -222,24 +222,13 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_f
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
-        total_frames = total_frames - start_frame
-
         scale, out_w, out_h = _scale_params(src_w, src_h)
-        n_chunks = math.ceil(total_frames / CHUNK_FRAMES)
+        n_objs = len(bboxes)
 
-        # 입력 bbox 목록을 출력 해상도로 변환
-        current_bboxes = [
+        init_bboxes = [
             (int(b[0]*scale), int(b[1]*scale), int(b[2]*scale), int(b[3]*scale))
             for b in bboxes
         ]
-
-        n_objs = len(bboxes)
-
-        # ── 추론 중에는 좌표만 기록 (영상 인코딩은 추론 후 별도 패스) ────────
-        bbox_log: list = []  # bbox_log[f][oid] = (x1,y1,x2,y2) or None — inference-space
-        crop_log: list = []  # crop_log[f][oid] = (cx, cy)               — inference-space
-        ema_cx = {i: (b[0] + b[2]) / 2.0 for i, b in enumerate(current_bboxes)}
-        ema_cy = {i: (b[1] + b[3]) / 2.0 for i, b in enumerate(current_bboxes)}
 
         ctx = (
             torch.autocast("cuda", dtype=torch.float16)
@@ -247,106 +236,176 @@ def run_inference(job_id: str, video_path: str, bboxes: list[list[int]], start_f
             else contextlib.nullcontext()
         )
 
-        for chunk_idx in range(n_chunks):
-            chunk_start = start_frame + chunk_idx * CHUNK_FRAMES
-            chunk_end   = min(chunk_start + CHUNK_FRAMES, start_frame + total_frames)
-            n_frames    = chunk_end - chunk_start
+        # ── 공통 헬퍼: 프레임 리스트 → SAM2 추적 + 보간 ──────────────────────
+        def _track_and_interpolate(frames_list, anchor_bboxes, tag):
+            """frames_list[0]을 앵커로 SAM2 추적 후 전체 프레임 bbox 리스트 반환."""
+            nonlocal chunk_dir
+            chunk_dir = UPLOADS_DIR / f"{job_id}_{tag}"
+            _write_chunk_jpegs(frames_list[::FRAME_SKIP], chunk_dir)
 
-            jobs[job_id]["chunk"] = f"{chunk_idx + 1}/{n_chunks}"
-
-            # ─ 프레임 로드 및 JPEG 저장 ─────────────────────────────────────
-            frames = []
-            cap = cv2.VideoCapture(video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
-            for _ in range(n_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if scale < 1.0:
-                    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
-                frames.append(frame)
-            cap.release()
-
-            if not frames:
-                break
-
-            chunk_dir = UPLOADS_DIR / f"{job_id}_chunk{chunk_idx}"
-            _write_chunk_jpegs(frames[::FRAME_SKIP], chunk_dir)
-
-            # ─ SAM2 추적 (FRAME_SKIP 간격으로 샘플링된 프레임만 처리) ────────
             last_masks: dict[int, np.ndarray] = {}
-            sampled_bboxes: list = []  # sampled_bboxes[s][oid] = bbox or None
+            sampled: list = []
 
             with inference_lock:
                 with torch.inference_mode(), ctx:
-                    state = predictor.init_state(
-                        str(chunk_dir), offload_video_to_cpu=False
-                    )
-                    for obj_id, (x1, y1, x2, y2) in enumerate(current_bboxes):
+                    state = predictor.init_state(str(chunk_dir), offload_video_to_cpu=False)
+                    for obj_id, (x1, y1, x2, y2) in enumerate(anchor_bboxes):
                         predictor.add_new_points_or_box(
                             state, box=(x1, y1, x2, y2), frame_idx=0, obj_id=obj_id
                         )
-
-                    for fid, obj_ids, masks in predictor.propagate_in_video(state):
-                        frame_bboxes: list = [None] * n_objs
+                    for _, obj_ids, masks in predictor.propagate_in_video(state):
+                        fb = [None] * n_objs
                         for obj_id, mask in zip(obj_ids, masks):
                             m = mask[0].cpu().numpy() > 0.0
                             last_masks[obj_id] = m
-                            frame_bboxes[obj_id] = _mask_to_bbox(m)
-                        sampled_bboxes.append(frame_bboxes)
-                        jobs[job_id]["progress"] = int(
-                            (chunk_idx * CHUNK_FRAMES + min(fid * FRAME_SKIP + 1, len(frames))) / total_frames * 100
-                        )
+                            fb[obj_id] = _mask_to_bbox(m)
+                        sampled.append(fb)
 
-            # ─ 보간: 샘플 bbox → 전체 프레임 bbox + EMA ──────────────────────
-            n_sampled = len(sampled_bboxes)
-            for f in range(len(frames)):
-                s_lo = min(f // FRAME_SKIP, n_sampled - 1)
-                s_hi = min(s_lo + 1, n_sampled - 1)
-                alpha = (f % FRAME_SKIP) / FRAME_SKIP if s_lo < s_hi else 0.0
-
-                frame_bboxes = [None] * n_objs
-                for oid in range(n_objs):
-                    bb_lo = sampled_bboxes[s_lo][oid]
-                    bb_hi = sampled_bboxes[s_hi][oid]
-                    if bb_lo is None:
-                        bb = bb_hi
-                    elif bb_hi is None or alpha == 0.0:
-                        bb = bb_lo
-                    else:
-                        bb = tuple(int(bb_lo[i] * (1 - alpha) + bb_hi[i] * alpha) for i in range(4))
-                    frame_bboxes[oid] = bb
-
-                    if bb:
-                        cx = (bb[0] + bb[2]) / 2.0
-                        cy = (bb[1] + bb[3]) / 2.0
-                        ema_cx[oid] = CROP_EMA_ALPHA * cx + (1 - CROP_EMA_ALPHA) * ema_cx[oid]
-                        ema_cy[oid] = CROP_EMA_ALPHA * cy + (1 - CROP_EMA_ALPHA) * ema_cy[oid]
-
-                bbox_log.append(frame_bboxes)
-                crop_log.append([(ema_cx[oid], ema_cy[oid]) for oid in range(n_objs)])
-
-            # ─ 다음 청크 초기 bbox = 이전 청크 마지막 마스크 ────────────────
-            new_bboxes = []
-            for obj_id, prev in enumerate(current_bboxes):
-                bb = _mask_to_bbox(last_masks[obj_id]) if obj_id in last_masks else None
-                new_bboxes.append(bb if bb else prev)
-            current_bboxes = new_bboxes
-
-            # ─ 임시 파일 정리 ────────────────────────────────────────────────
-            del frames
             shutil.rmtree(str(chunk_dir), ignore_errors=True)
             chunk_dir = None
+
+            # 선형 보간: 샘플 → 전체 프레임
+            n_s = len(sampled)
+            result = []
+            for f in range(len(frames_list)):
+                s_lo = min(f // FRAME_SKIP, n_s - 1)
+                s_hi = min(s_lo + 1, n_s - 1)
+                alpha = (f % FRAME_SKIP) / FRAME_SKIP if s_lo < s_hi else 0.0
+                fb = [None] * n_objs
+                for oid in range(n_objs):
+                    bl, bh = sampled[s_lo][oid], sampled[s_hi][oid]
+                    if bl is None:                bb = bh
+                    elif bh is None or alpha == 0.0: bb = bl
+                    else: bb = tuple(int(bl[i]*(1-alpha) + bh[i]*alpha) for i in range(4))
+                    fb[oid] = bb
+                result.append(fb)
+
+            return result, last_masks
+
+        def _advance_bboxes(current, last_masks):
+            """다음 청크 앵커 bbox: 마지막 마스크 → bbox, 실패 시 이전 값 유지."""
+            nxt = []
+            for oid in range(n_objs):
+                bb = _mask_to_bbox(last_masks[oid]) if oid in last_masks else None
+                nxt.append(bb if bb is not None else current[oid])
+            return nxt
+
+        # ════════════════════════════════════════════════════════════════
+        # Phase 1  역방향: start_frame-1 → 0
+        # ════════════════════════════════════════════════════════════════
+        back_bbox_log: list = []   # 시간순으로 채워짐 (frame 0 ~ start_frame-1)
+
+        if start_frame > 0:
+            n_back = math.ceil(start_frame / CHUNK_FRAMES)
+            back_bboxes = list(init_bboxes)
+
+            for bi in range(n_back):
+                t_end   = start_frame - bi * CHUNK_FRAMES      # 시간상 끝 (exclusive)
+                t_start = max(0, t_end - CHUNK_FRAMES)         # 시간상 시작 (inclusive)
+
+                # 순차 로드 후 역순으로 뒤집어 SAM2에 넘김
+                # → SAM2 입장에서 index 0 = 시간상 최신 프레임 (앵커에 가장 가까운 프레임)
+                cap = cv2.VideoCapture(video_path)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, t_start)
+                frames_fwd = []
+                for _ in range(t_end - t_start):
+                    ret, frm = cap.read()
+                    if not ret: break
+                    if scale < 1.0:
+                        frm = cv2.resize(frm, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                    frames_fwd.append(frm)
+                cap.release()
+
+                if not frames_fwd: break
+
+                frames_rev = list(reversed(frames_fwd))
+
+                chunk_bboxes_rev, last_masks = _track_and_interpolate(
+                    frames_rev, back_bboxes, f"back{bi}"
+                )
+
+                # chunk_bboxes_rev[0] = t_end-1, [1] = t_end-2, …
+                # 뒤집으면 시간순 [t_start, …, t_end-1] → 맨 앞에 삽입
+                back_bbox_log = list(reversed(chunk_bboxes_rev)) + back_bbox_log
+
+                jobs[job_id]["progress"] = int((bi + 1) * CHUNK_FRAMES / total_frames * 50)
+                jobs[job_id]["chunk"] = f"역방향 {bi + 1}/{n_back}"
+
+                back_bboxes = _advance_bboxes(back_bboxes, last_masks)
+
+                del frames_fwd, frames_rev
+                gc.collect()
+                if device_str == "cuda":
+                    torch.cuda.empty_cache()
+
+        # ════════════════════════════════════════════════════════════════
+        # Phase 2  순방향: start_frame → total_frames-1
+        # ════════════════════════════════════════════════════════════════
+        fwd_frames   = total_frames - start_frame
+        n_fwd        = math.ceil(fwd_frames / CHUNK_FRAMES)
+        cur_bboxes   = list(init_bboxes)
+        fwd_bbox_log: list = []
+
+        for ci in range(n_fwd):
+            c_start = start_frame + ci * CHUNK_FRAMES
+            c_end   = min(c_start + CHUNK_FRAMES, total_frames)
+
+            jobs[job_id]["chunk"] = f"순방향 {ci + 1}/{n_fwd}"
+
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, c_start)
+            frames = []
+            for _ in range(c_end - c_start):
+                ret, frm = cap.read()
+                if not ret: break
+                if scale < 1.0:
+                    frm = cv2.resize(frm, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                frames.append(frm)
+            cap.release()
+
+            if not frames: break
+
+            chunk_bboxes, last_masks = _track_and_interpolate(frames, cur_bboxes, f"fwd{ci}")
+            fwd_bbox_log.extend(chunk_bboxes)
+
+            base = 50 if start_frame > 0 else 0
+            span = 50 if start_frame > 0 else 100
+            jobs[job_id]["progress"] = base + int(
+                (ci * CHUNK_FRAMES + len(frames)) / fwd_frames * span
+            )
+
+            cur_bboxes = _advance_bboxes(cur_bboxes, last_masks)
+
+            del frames
             gc.collect()
             if device_str == "cuda":
                 torch.cuda.empty_cache()
 
-        # ── 추론 완료 후 원본 해상도로 영상 조립 ────────────────────────────
+        # ════════════════════════════════════════════════════════════════
+        # 결합 · EMA(시간순 1회 통과) · 영상 조립
+        # ════════════════════════════════════════════════════════════════
+        bbox_log = back_bbox_log + fwd_bbox_log
+
+        ema_cx = {i: (b[0]+b[2])/2.0 for i, b in enumerate(init_bboxes)}
+        ema_cy = {i: (b[1]+b[3])/2.0 for i, b in enumerate(init_bboxes)}
+        crop_log = []
+        for fb in bbox_log:
+            row = []
+            for oid in range(n_objs):
+                bb = fb[oid]
+                if bb:
+                    cx = (bb[0]+bb[2])/2.0
+                    cy = (bb[1]+bb[3])/2.0
+                    ema_cx[oid] = CROP_EMA_ALPHA * cx + (1 - CROP_EMA_ALPHA) * ema_cx[oid]
+                    ema_cy[oid] = CROP_EMA_ALPHA * cy + (1 - CROP_EMA_ALPHA) * ema_cy[oid]
+                row.append((ema_cx[oid], ema_cy[oid]))
+            crop_log.append(row)
+
         jobs[job_id]["status"] = "cropping"
         main_filename, crop_filenames = _assemble_videos(
             video_path, bbox_log, crop_log,
             fps, job_id, n_objs, scale, src_w, src_h,
-            start_frame,
+            start_frame=0,   # 역방향 포함 → 항상 프레임 0부터 조립
         )
 
         jobs[job_id].update({
