@@ -8,6 +8,7 @@ import contextlib
 import gc
 import math
 import shutil
+import subprocess
 import sys
 import uuid
 import base64
@@ -137,6 +138,30 @@ def _write_chunk_jpegs(frames: list, chunk_dir: Path):
         )
 
 
+# ── FFmpeg pipe writer ─────────────────────────────────────────────────────────
+def _open_ffmpeg_writer(out_path, fps: float, w: int, h: int) -> subprocess.Popen:
+    """bgr24 raw 프레임을 stdin으로 받아 libx264(ultrafast) MP4를 출력하는 ffmpeg 프로세스."""
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        ff = get_ffmpeg_exe()
+    except Exception:
+        ff = "ffmpeg"
+    return subprocess.Popen(
+        [
+            ff, "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}", "-pix_fmt", "bgr24", "-r", str(int(fps)),
+            "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "23", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(out_path),
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 # ── Post-inference assembly (main + crop) ──────────────────────────────────────
 def _assemble_videos(
     video_path: str,
@@ -147,25 +172,15 @@ def _assemble_videos(
     start_frame: int = 0,
 ) -> tuple[str, list[str]]:
     """추론 완료 후 원본 영상을 1회 재독해 메인·크롭 영상을 원본 해상도로 생성한다."""
-    import imageio
-
     crop_h = src_h
     crop_w = int(src_h * 9 / 16) & ~1
 
     main_filename  = f"{job_id}.mp4"
     crop_filenames = [f"{job_id}_obj{i}.mp4" for i in range(n_objs)]
 
-    main_writer = imageio.get_writer(
-        str(OUTPUTS_DIR / main_filename),
-        fps=fps, codec="libx264", pixelformat="yuv420p",
-        output_params=["-crf", "23", "-movflags", "+faststart"],
-    )
-    crop_writers = [
-        imageio.get_writer(
-            str(OUTPUTS_DIR / crop_filenames[i]),
-            fps=fps, codec="libx264", pixelformat="yuv420p",
-            output_params=["-crf", "23", "-movflags", "+faststart"],
-        )
+    main_proc  = _open_ffmpeg_writer(OUTPUTS_DIR / main_filename,  fps, src_w, src_h)
+    crop_procs = [
+        _open_ffmpeg_writer(OUTPUTS_DIR / crop_filenames[i], fps, crop_w, crop_h)
         for i in range(n_objs)
     ]
 
@@ -176,31 +191,28 @@ def _assemble_videos(
         if not ret:
             break
 
-        # 크롭 영상: 오버레이 전 원본 프레임에서 크롭 (bbox 없음)
+        # 크롭 영상: BGR raw 그대로 pipe (색 변환 불필요)
         for oid, (cx_inf, cy_inf) in enumerate(centers):
-            cx = cx_inf / scale
-            cy = cy_inf / scale
-            crop = _crop_9x16(frame, cx, cy, crop_w, crop_h)
-            crop_writers[oid].append_data(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            crop = _crop_9x16(frame, cx_inf / scale, cy_inf / scale, crop_w, crop_h)
+            crop_procs[oid].stdin.write(crop.tobytes())
 
-        # 메인 영상: bbox 좌표를 원본 해상도로 역스케일해 오버레이
+        # 메인 영상: bbox 오버레이 후 BGR raw pipe
         for oid, bb in enumerate(bboxes):
             if bb is None:
                 continue
-            x1 = int(bb[0] / scale)
-            y1 = int(bb[1] / scale)
-            x2 = int(bb[2] / scale)
-            y2 = int(bb[3] / scale)
+            x1 = int(bb[0] / scale); y1 = int(bb[1] / scale)
+            x2 = int(bb[2] / scale); y2 = int(bb[3] / scale)
             color = COLORS_BGR[oid % len(COLORS_BGR)]
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, f"obj{oid}", (x1, max(y1 - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-        main_writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        main_proc.stdin.write(frame.tobytes())
 
     cap.release()
-    main_writer.close()
-    for w in crop_writers:
-        w.close()
+    main_proc.stdin.close();  main_proc.wait()
+    for p in crop_procs:
+        p.stdin.close();  p.wait()
+
     return main_filename, crop_filenames
 
 
